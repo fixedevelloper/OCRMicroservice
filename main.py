@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 app = FastAPI(title="OCR + Gemini API")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
