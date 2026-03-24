@@ -57,9 +57,27 @@ def preprocess_image(image_bytes: bytes):
     )
 
     return thresh
-
-
 def extract_text(image_bytes: bytes):
+    try:
+        img = preprocess_image(image_bytes)
+
+        text = pytesseract.image_to_string(img, lang="fra+eng", config="--oem 3 --psm 4")
+
+        # Fallback si texte vide
+        if not text.strip():
+            logger.warning("⚠️ OCR preprocess failed, fallback RAW")
+            text = pytesseract.image_to_string(
+                np.frombuffer(image_bytes, np.uint8).reshape(-1,1),
+                lang="fra+eng", config="--oem 3 --psm 4"
+            )
+
+        return text.strip()
+
+    except Exception as e:
+        logger.error(f"OCR error: {e}")
+        return ""
+
+""" def extract_text(image_bytes: bytes):
     try:
         img = preprocess_image(image_bytes)
 
@@ -77,7 +95,7 @@ def extract_text(image_bytes: bytes):
 
     except Exception as e:
         logger.error(f"OCR error: {e}")
-        return ""
+        return "" """
 
 
 # =====================================================
