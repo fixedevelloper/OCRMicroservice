@@ -2,24 +2,51 @@ from fastapi import FastAPI, Form, HTTPException
 import requests
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 import os
 import pytesseract
 import cv2
 import numpy as np
 from google import genai
-import uvicorn
 import re
+from pdf2image import convert_from_bytes
 
 # =====================================================
-# CONFIG
+# CONFIG LOGGING
 # =====================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+LOG_FILE = "/var/www/accountIa/storage/logs/ocr_api.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+logger = logging.getLogger("ocr_api")
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s"
+)
+
+file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
+)
+file_handler.setFormatter(formatter)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+
+logger.handlers.clear()
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# =====================================================
+# CONFIG APP
+# =====================================================
 
 load_dotenv()
+
+# 🔥 Forcer chemin Tesseract
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
 app = FastAPI(title="OCR + Gemini API")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -28,7 +55,6 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY manquante")
 
-# ✅ BON CLIENT
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # =====================================================
@@ -36,68 +62,89 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # =====================================================
 
 def preprocess_image(image_bytes: bytes):
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # amélioration contraste
-    clahe = cv2.createCLAHE(clipLimit=3.0)
-    gray = clahe.apply(gray)
-
-    # débruitage
-    gray = cv2.fastNlMeansDenoising(gray)
-
-    # threshold
-    thresh = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        11, 2
-    )
-
-    return thresh
-def extract_text(image_bytes: bytes):
     try:
-        img = preprocess_image(image_bytes)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        text = pytesseract.image_to_string(img, lang="fra+eng", config="--oem 3 --psm 4")
+        if img is None:
+            logger.error("❌ Image decode failed")
+            return None
 
-        # Fallback si texte vide
-        if not text.strip():
-            logger.warning("⚠️ OCR preprocess failed, fallback RAW")
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+        # debug image
+        cv2.imwrite("/tmp/debug.jpg", gray)
+
+        return gray
+
+    except Exception:
+        logger.exception("❌ preprocess_image error")
+        return None
+
+
+def extract_images_from_pdf(pdf_bytes: bytes):
+    try:
+        images = convert_from_bytes(pdf_bytes)
+        return images  # liste d’images PIL
+    except Exception:
+        logger.exception("❌ PDF conversion error")
+        return []
+    
+def extract_text(image_bytes: bytes, content_type: str):
+    try:
+        texts = []
+
+        # ===== CAS PDF =====
+        if "pdf" in content_type:
+            logger.info("📄 PDF détecté")
+
+            images = extract_images_from_pdf(image_bytes)
+
+            for i, img_pil in enumerate(images):
+                img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2GRAY)
+
+                text = pytesseract.image_to_string(
+                    img,
+                    lang="fra+eng",
+                    config="--oem 3 --psm 4"
+                )
+
+                if text.strip():
+                    texts.append(text)
+
+        # ===== CAS IMAGE =====
+        else:
+            img = preprocess_image(image_bytes)
+
             text = pytesseract.image_to_string(
-                np.frombuffer(image_bytes, np.uint8).reshape(-1,1),
-                lang="fra+eng", config="--oem 3 --psm 4"
+                img,
+                lang="fra+eng",
+                config="--oem 3 --psm 4"
             )
 
-        return text.strip()
+            if not text.strip():
+                logger.warning("⚠️ fallback RAW image")
+                nparr = np.frombuffer(image_bytes, np.uint8)
+                raw_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
+                text = pytesseract.image_to_string(
+                    raw_img,
+                    lang="fra+eng",
+                    config="--oem 3 --psm 4"
+                )
+
+            texts.append(text)
+
+        final_text = "\n".join(texts)
+
+        logger.info(f"OCR total length: {len(final_text)}")
+
+        return final_text.strip()
+
+    except Exception:
+        logger.exception("❌ OCR global error")
         return ""
-
-""" def extract_text(image_bytes: bytes):
-    try:
-        img = preprocess_image(image_bytes)
-
-        text = pytesseract.image_to_string(
-            img,
-            lang="fra+eng",
-            config="--oem 3 --psm 6"
-        )
-
-        text = re.sub(r'\s+', ' ', text).strip()
-
-        logger.info(f"OCR OK ({len(text)} chars)")
-
-        return text
-
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        return "" """
-
-
 # =====================================================
 # GEMINI
 # =====================================================
@@ -120,7 +167,10 @@ def parse_amount(value):
 
 
 def analyze_with_gemini(text: str):
-    prompt = f"""
+    try:
+        logger.info("🤖 Analyse Gemini lancée")
+
+        prompt = f"""
 Analyse ce texte OCR de facture.
 
 Retourne STRICTEMENT JSON :
@@ -146,18 +196,16 @@ Texte :
 {text}
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt]
-    )
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt]
+        )
 
-    raw = response.text
+        raw = response.text
 
-    try:
         clean = clean_json(raw)
         data = json.loads(clean)
 
-        # 🔥 sécuriser montants
         data["amount_ht"] = parse_amount(data.get("amount_ht"))
         data["vat_amount"] = parse_amount(data.get("vat_amount"))
         data["total_amount"] = parse_amount(data.get("total_amount"))
@@ -165,9 +213,8 @@ Texte :
         return data
 
     except Exception:
-        logger.warning("❌ JSON parsing failed")
+        logger.exception("❌ Gemini parsing error")
         return {"raw_response": raw}
-
 
 # =====================================================
 # API
@@ -179,25 +226,28 @@ async def analyze_document(
     document_url: str = Form(...)
 ):
     try:
-        logger.info(f"📄 Document {id_document}")
+        logger.info(f"📄 Document ID: {id_document}")
+        logger.info(f"🌐 URL: {document_url}")
 
-        # 1. Télécharger image
+        # Télécharger image
         resp = requests.get(document_url, timeout=20)
         resp.raise_for_status()
 
         image_bytes = resp.content
-
-        # 2. OCR
-        text = extract_text(image_bytes)
+        logger.info(f"📦 Image size: {len(image_bytes)} bytes")
+        content_type = resp.headers.get("Content-Type", "")
+        # OCR
+        text = extract_text(image_bytes, content_type)
 
         if not text:
+            logger.error("❌ Aucun texte OCR détecté")
             return {
                 "success": False,
                 "id_document": id_document,
                 "error": "Aucun texte OCR"
             }
 
-        # 3. Gemini
+        # Gemini
         result = analyze_with_gemini(text)
 
         return {
@@ -210,7 +260,6 @@ async def analyze_document(
         logger.exception("❌ Erreur API")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # =====================================================
 # HEALTH
 # =====================================================
@@ -218,11 +267,3 @@ async def analyze_document(
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-# =====================================================
-# RUN
-# =====================================================
-
-""" if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True) """
